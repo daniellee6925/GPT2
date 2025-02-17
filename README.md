@@ -1,0 +1,1 @@
+This project is to replicate a 124M parameter GPT 2 model 
