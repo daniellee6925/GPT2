@@ -45,9 +45,26 @@ class CasualSelfAttention(nn.Module):
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # (T, T)
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
         y = att @ v  # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguos().view(B, T, C)
+
+        # contiguous creates new memory in pytorch
+        # transpose do not change the underlying memory.
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
+
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.gelu = nn.GELU(approximate="tanh")
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        return x
 
 
 class GPT(nn.Module):
