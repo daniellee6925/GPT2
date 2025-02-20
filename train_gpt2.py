@@ -99,6 +99,26 @@ class GPT(nn.Module):
         # last linear layer to match convert Channel dim to vocab_size
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+    def forward(self, idx):
+        # idx has shape (B, T)
+        B, T = idx.shape
+        assert T <= self.config.block_size, (
+            f"Cannot forward sequence lenght of {T}, block size is {self.config.block_size}"
+        )
+
+        # forward the token and positional embeddings
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)  # shape T
+        pos_emb = self.transformer.wpe(pos)
+        tok_emb = self.transformer.wte(idx)
+        x = pos_emb + tok_emb
+        # forward the blocks of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+        # forward the final layernorm and classifier
+        x = self.transformer.ln_f(x)  # (B, T, n_embd)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+        return logits
+
     @classmethod
     def from_pretrained(cls, model_type):
         """loads pretrained GPT-2 model weights from hugging face"""
