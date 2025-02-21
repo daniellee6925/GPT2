@@ -8,7 +8,7 @@ import tiktoken
 # -----------------------------------------
 
 
-class CasualSelfAttention(nn.Module):
+class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -30,7 +30,7 @@ class CasualSelfAttention(nn.Module):
         B, T, C = x.size()
 
         qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=-1)
+        q, k, v = qkv.split(self.n_embd, dim=2)
 
         # (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
@@ -39,8 +39,8 @@ class CasualSelfAttention(nn.Module):
 
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # (T, T)
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        att = F.softmax(att, dim=-1)
         y = att @ v  # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-
         # contiguous creates new memory in pytorch
         # transpose do not change the underlying memory.
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -66,7 +66,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CasualSelfAttention(config)
+        self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
@@ -191,37 +191,12 @@ class GPT(nn.Module):
 # -----------------------------------------------------------------------
 num_return_sequences = 5
 max_length = 30
-from transformers import GPT2LMHeadModel
 
-hf_gpt2 = GPT2LMHeadModel.from_pretrained("gpt2")
-hf_gpt2.to("cuda")
 model = GPT.from_pretrained("gpt2")
 model.eval()
 model.to("cuda")
 
-sd_hf = model.state_dict()
-print(sd_hf["transformer.h.0.attn.c_attn.weight"].shape)
 
-transposed = [
-    "attn.c_attn.weight",
-    "attn.c_proj.weight",
-    "mlp.c_fc.weight",
-    "mlp.c_proj.weight",
-]
-# Assume `model` is your model and `gpt2_model` is the pretrained GPT-2
-for (name1, param1), (name2, param2) in zip(
-    model.named_parameters(), hf_gpt2.named_parameters()
-):
-    if any(name1.endswith(w) for w in transposed):
-        param1_to_compare = param1.t()  # Transpose the parameter if it matches
-    else:
-        param1_to_compare = param1  # Use original parameter
-    if not torch.allclose(param1_to_compare, param2, atol=1e-6):
-        print(f"🚨 Mismatch in {name1}")
-    else:
-        print(f"✅ {name1} matches!")
-
-"""
 enc = tiktoken.get_encoding("gpt2")
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long)  # (8, )
@@ -254,4 +229,32 @@ for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
     print(">", decoded)
+
+
+"""
+# check if weights are loaded correctly
+from transformers import GPT2LMHeadModel
+hf_gpt2 = GPT2LMHeadModel.from_pretrained("gpt2")
+hf_gpt2.to("cuda")
+sd_hf = model.state_dict()
+print(sd_hf["transformer.h.0.attn.c_attn.weight"].shape)
+
+transposed = [
+    "attn.c_attn.weight",
+    "attn.c_proj.weight",
+    "mlp.c_fc.weight",
+    "mlp.c_proj.weight",
+]
+# Assume `model` is your model and `gpt2_model` is the pretrained GPT-2
+for (name1, param1), (name2, param2) in zip(
+    model.named_parameters(), hf_gpt2.named_parameters()
+):
+    if any(name1.endswith(w) for w in transposed):
+        param1_to_compare = param1.t()  # Transpose the parameter if it matches
+    else:
+        param1_to_compare = param1  # Use original parameter
+    if not torch.allclose(param1_to_compare, param2, atol=1e-6):
+        print(f"🚨 Mismatch in {name1}")
+    else:
+        print(f"✅ {name1} matches!")
 """
