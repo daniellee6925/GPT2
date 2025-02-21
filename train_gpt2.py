@@ -103,6 +103,19 @@ class GPT(nn.Module):
         # last linear layer to match convert Channel dim to vocab_size
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+        # weight sharing scheme same matrix for wte and linear layer
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear()):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, idx, targets=None):
         # idx has shape (B, T)
         B, T = idx.shape
@@ -191,16 +204,6 @@ class GPT(nn.Module):
         return model
 
 
-# -----------------------------------------------------------------------
-# attempt to auto select device
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-
-print(f"using device: {device}")
-device = "cpu"  # override
-
-
 # ---------------------------------------------------------------------------
 class DataloaderLite:
     def __init__(self, B, T):
@@ -231,7 +234,17 @@ class DataloaderLite:
         return x, y
 
 
+# -----------------------------------------------------------------------
+# attempt to auto select device
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+
+print(f"using device: {device}")
+# device = "cpu"  # override
+
 # ------------------------------------------------------------------------------
+train_loader = DataloaderLite(B=4, T=32)
 
 model = GPT(GPTConfig())
 model.to(device)
@@ -239,6 +252,8 @@ model.to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     logits, loss = model(x, y)
     loss.backward()
