@@ -103,7 +103,7 @@ class GPT(nn.Module):
         # last linear layer to match convert Channel dim to vocab_size
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         # idx has shape (B, T)
         B, T = idx.shape
         assert T <= self.config.block_size, (
@@ -121,7 +121,10 @@ class GPT(nn.Module):
         # forward the final layernorm and classifier
         x = self.transformer.ln_f(x)  # (B, T, n_embd)
         logits = self.lm_head(x)  # (B, T, vocab_size)
-        return logits
+        loss = None
+        if targets is not None:  # (B*T, vocab_size)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -189,19 +192,79 @@ class GPT(nn.Module):
 
 
 # -----------------------------------------------------------------------
+# attempt to auto select device
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+
+print(f"using device: {device}")
+device = "cpu"  # override
+
+
+# ---------------------------------------------------------------------------
+class DataloaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        with open("input.txt", "r") as f:
+            text = f.read()
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+
+        # state
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+        x = (buf[:-1]).view(B, T)  # x data
+        y = (buf[1:]).view(B, T)  # labels
+
+        # advance to next position
+        self.current_position += B * T
+        # if loading the next batch is out of bounds, reset
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
+
+
+# ------------------------------------------------------------------------------
+
+model = GPT(GPTConfig())
+model.to(device)
+# logits, loss = model(x, y)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
+
+print(loss)
+import sys
+
+sys.exit(0)
+
+"""
+# generate samples 
 num_return_sequences = 5
 max_length = 30
 
 model = GPT.from_pretrained("gpt2")
 model.eval()
-model.to("cuda")
+model.to(device)
 
 
 enc = tiktoken.get_encoding("gpt2")
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long)  # (8, )
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (5, 8)
-x = tokens.to("cuda")
+x = tokens.to(device)
 
 
 # generate
@@ -229,7 +292,7 @@ for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
     print(">", decoded)
-
+"""
 
 """
 # check if weights are loaded correctly
