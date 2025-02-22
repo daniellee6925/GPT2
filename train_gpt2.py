@@ -257,12 +257,33 @@ train_loader = DataloaderLite(B=16, T=1024)
 # use TF 32
 torch.set_float32_matmul_precision("high")
 
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
+# model = torch.compile(model)
+
+max_lr = 3 - 4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
 
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+def get_lr(it):
+    # linear warmup for warmup steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    # if it > lr_decay_itrs, return min lr
+    if it > max_steps:
+        return min_lr
+    # if in between, use cosine decay down to min lr
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    # coeff starts at 1 and goes to 0
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=[0.9, 0.95], eps=1e-8)
+for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -271,11 +292,20 @@ for i in range(50):
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
     loss.backward()
+    # Apply gradient clipping before optimizer step (prevent exploding gradients)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
     optimizer.step()
     torch.cuda.synchronize()  # wait for GPU to finish work
     t1 = time.time()
     dt = (t1 - t0) * 1000
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms")
+    tokens_processed = train_loader.B * train_loader.T
+    tokens_per_sec = tokens_processed / dt
+    print(
+        f"step {step} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens_per_sec {tokens_per_sec:.2f}"
+    )
 
 print(loss)
 import sys
