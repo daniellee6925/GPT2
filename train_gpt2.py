@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 import tiktoken
-
+import time
 # -----------------------------------------
 
 
@@ -111,7 +111,7 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear()):
+        if isinstance(module, nn.Linear):
             std = 0.02
             if hasattr(module, "NANOGPT_SCALE_INIT"):
                 std *= 2 * (self.config.n_layer) ** -0.5
@@ -249,21 +249,30 @@ print(f"using device: {device}")
 # device = "cpu"  # override
 
 # ------------------------------------------------------------------------------
-train_loader = DataloaderLite(B=4, T=32)
+train_loader = DataloaderLite(B=16, T=1024)
+
+# use TF 32
+torch.set_float32_matmul_precision("high")
 
 model = GPT(GPTConfig())
 model.to(device)
-# logits, loss = model(x, y)
+
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    # use BF16 using autocast (mixed precision - matrix multiplies)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize()  # wait for GPU to finish work
+    t1 = time.time()
+    dt = (t1 - t0) * 1000
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms")
 
 print(loss)
 import sys
