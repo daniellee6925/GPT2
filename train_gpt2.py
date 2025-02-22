@@ -5,6 +5,7 @@ from torch.nn import functional as F
 import math
 import tiktoken
 import time
+import inspect
 # -----------------------------------------
 
 
@@ -211,6 +212,36 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters in 2D or above will be weight decayed
+        # all tensors in matmuls + embeddings decay, all biases and layernorms don't
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(
+            f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:, } parameters"
+        )
+        print(
+            f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:, } parameters"
+        )
+        # create AdamW optimizer and use the fused version if it is available
+        # enables optimized CUDA kernel implementations
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and "cuda" in device
+        print(f"Using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(
+            optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8
+        )
+        return optimizer
+
 
 # ---------------------------------------------------------------------------
 class DataloaderLite:
@@ -261,8 +292,8 @@ model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 # model = torch.compile(model)
 
-max_lr = 3 - 4
-min_lr = max_lr * 0.1
+max_lr = 6e-4
+min_lr = max_lr * 0.1  # 10% of max lr
 warmup_steps = 10
 max_steps = 50
 
@@ -304,7 +335,7 @@ for step in range(max_steps):
     tokens_processed = train_loader.B * train_loader.T
     tokens_per_sec = tokens_processed / dt
     print(
-        f"step {step} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens_per_sec {tokens_per_sec:.2f}"
+        f"step {step} | loss: {loss.item():.6f} | norm: {norm:.4f} | lr: {lr:4f} | dt: {dt:.2f}ms | tokens_per_sec {tokens_per_sec:.2f}"
     )
 
 print(loss)
