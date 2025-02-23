@@ -316,7 +316,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 524288  # 2 ** 19 ~0.5M in number of tokens
-B = 4
+B = 8
 T = 1024
 assert total_batch_size % (B * T * ddp_world_size) == 0, (
     "make sure total_batch_size is divisible by B*T*ddp_world_size"
