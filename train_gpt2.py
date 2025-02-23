@@ -8,6 +8,8 @@ import time
 import inspect
 import os
 from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 # -----------------------------------------
 
 
@@ -248,9 +250,11 @@ class GPT(nn.Module):
 
 # ---------------------------------------------------------------------------
 class DataloaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
         with open("input.txt", "r") as f:
             text = f.read()
         enc = tiktoken.get_encoding("gpt2")
@@ -260,7 +264,7 @@ class DataloaderLite:
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
         # state
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -269,7 +273,7 @@ class DataloaderLite:
         y = (buf[1:]).view(B, T)  # labels
 
         # advance to next position
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
         # if loading the next batch is out of bounds, reset
         if self.current_position + (B * T + 1) > len(self.tokens):
             self.current_position = 0
@@ -312,7 +316,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 524288  # 2 ** 19 ~0.5M in number of tokens
-B = 8
+B = 4
 T = 1024
 assert total_batch_size % (B * T * ddp_world_size) == 0, (
     "make sure total_batch_size is divisible by B*T*ddp_world_size"
@@ -322,18 +326,21 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulated steps: {grad_accum_steps}")
 
-print("i am gpu", ddp_rank)
-import sys
 
-sys.exit(0)
-train_loader = DataloaderLite(B=B, T=T)
+train_loader = DataloaderLite(
+    B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size
+)
 
 # use TF 32
 torch.set_float32_matmul_precision("high")
 
+# create model
 model = GPT(GPTConfig(vocab_size=50304))  # set vocab size to a 'nice' number
 model.to(device)
 # model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model  # always contains the "raw" unwrapped model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1  # 10% of max lr
@@ -356,7 +363,7 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 
-optimizer = model.configure_optimizers(
+optimizer = raw_model.configure_optimizers(
     weight_decay=0.1, learning_rate=6e-4, device=device
 )
 for step in range(max_steps):
@@ -378,8 +385,14 @@ for step in range(max_steps):
             # we want MEAN. scale the loss by dividing my accum_steps
             loss = loss / grad_accum_steps
             loss_accum += loss.detach()
+            # process of sharing and averaging gradients across multiple GPUs
+            if ddp:
+                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             loss.backward()
 
+    # all ranks with have average loss accum
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     # Apply gradient clipping before optimizer step (prevent exploding gradients)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
@@ -391,11 +404,13 @@ for step in range(max_steps):
     dt = (t1 - t0) * 1000
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
     tokens_per_sec = tokens_processed / dt
-    print(
-        f"step {step} | loss: {loss_accum.item():.6f} | norm: {norm:.4f} | lr: {lr:4f} | dt: {dt:.2f}ms | tokens_per_sec {tokens_per_sec:.2f}"
-    )
+    if master_process:
+        print(
+            f"step {step} | loss: {loss_accum.item():.6f} | norm: {norm:.4f} | lr: {lr:4f} | dt: {dt:.2f}ms | tokens_per_sec {tokens_per_sec:.2f}"
+        )
+if ddp:
+    destroy_process_group()
 
-print(loss)
 import sys
 
 sys.exit(0)
