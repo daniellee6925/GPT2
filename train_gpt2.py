@@ -6,6 +6,8 @@ import math
 import tiktoken
 import time
 import inspect
+import os
+from torch.distributed import init_process_group, destroy_process_group
 # -----------------------------------------
 
 
@@ -274,14 +276,35 @@ class DataloaderLite:
         return x, y
 
 
-# -----------------------------------------------------------------------
-# attempt to auto select device
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
+# ------------------------------------------------------------------------------
+# set up distributed data parallel
+# torchrun command sets the new variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
+if ddp:
+    # use of DDP demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for ddp, we need CUDA"
+    init_process_group(backend="nccl")
+    ddp_rank = int(os.environ("RANK"))
+    ddp_local_rank = int(os.environ("LOCAL_RANK"))
+    ddp_world_size = int(os.environ("WORLD_SIZE"))
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0  # this process will do logging, checkpointing
 
-print(f"using device: {device}")
-# device = "cpu"  # override
+else:
+    # vanilla, no DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to auto detect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+    # device = "cpu"  # override
 
 # ------------------------------------------------------------------------------
 torch.manual_seed(1337)
@@ -289,13 +312,20 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 524288  # 2 ** 19 ~0.5M in number of tokens
-B = 16
+B = 8
 T = 1024
-assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B*T"
-grad_accum_steps = total_batch_size // (B * T)
-print(f"total desired batch size: {total_batch_size}")
-print(f"=> calculated gradient accumulated steps: {grad_accum_steps}")
+assert total_batch_size % (B * T * ddp_world_size) == 0, (
+    "make sure total_batch_size is divisible by B*T*ddp_world_size"
+)
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulated steps: {grad_accum_steps}")
 
+print("i am gpu", ddp_rank)
+import sys
+
+sys.exit(0)
 train_loader = DataloaderLite(B=B, T=T)
 
 # use TF 32
