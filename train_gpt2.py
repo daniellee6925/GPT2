@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import numpy as np
 import math
 import tiktoken
 import time
@@ -249,8 +250,15 @@ class GPT(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+def load_tokens(filename):
+    npt = np.load(filename)
+    npt = npt.astype(np.int32)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
+
 class DataloaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
@@ -264,6 +272,26 @@ class DataloaderLite:
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
         # state
+        self.current_position = self.B * self.T * self.process_rank
+
+        """
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
+        self.reset()
+        """
+
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
@@ -328,7 +356,12 @@ if master_process:
 
 
 train_loader = DataloaderLite(
-    B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size
+    B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train"
+)
+
+
+val_loader = DataloaderLite(
+    B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="vrain"
 )
 
 # use TF 32
@@ -366,8 +399,30 @@ def get_lr(it):
 optimizer = raw_model.configure_optimizers(
     weight_decay=0.1, learning_rate=6e-4, device=device
 )
+
 for step in range(max_steps):
     t0 = time.time()
+
+    # evaluate validation loss
+    model.eval()
+    val_loader.reset()
+    with torch.no_grad():
+        val_loss_accum = 0.0
+        val_loss_steps = 20
+        for _ in range(val_loss_accum):
+            x, y = val_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+            loss = loss / val_loss_steps
+            val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"Validation Loss: {val_loss_accum.item():.4f}")
+
+    # training loop
+    model.train()  # model was set to eval above
     optimizer.zero_grad()
     loss_accum = 0.0
 
