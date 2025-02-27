@@ -343,6 +343,7 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
+
 total_batch_size = 524288  # 2 ** 19 ~0.5M in number of tokens
 B = 8
 T = 1024
@@ -370,6 +371,7 @@ torch.set_float32_matmul_precision("high")
 # create model
 model = GPT(GPTConfig(vocab_size=50304))  # set vocab size to a 'nice' number
 model.to(device)
+enc = tiktoken.get_encoding("gpt2")
 # model = torch.compile(model)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -420,6 +422,38 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"Validation Loss: {val_loss_accum.item():.4f}")
+
+    # once in a while generate from the model (except step 0, which is noise)
+    if step > 0 and step % 250 == 0:
+        model.eval()
+        num_return_sequences = 4
+        max_length = 32
+        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42 + ddp_rank)
+        while xgen.size(1) < max_length:
+            # forward the model to get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(xgen)  # (B, T, vocab_size)
+
+                # take the logits at the last position
+                logits = logits[:, -1, :]  # (B, vocab_size)
+                # get probabilities
+                probs = F.softmax(logits, dim=-1)
+                # do top-k sampling of 50
+                topk_probs, top_indices = torch.topk(probs, 50, dim=-1)
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng)  # (B, 1)
+                xcol = torch.gather(top_indices, -1, ix)  # (B,1)
+                xgen = torch.cat((xgen, xcol), dim=1)
+        # print the generated text
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
+            print(f"rank {ddp_rank} sample {i}: {decoded}")
 
     # training loop
     model.train()  # model was set to eval above
